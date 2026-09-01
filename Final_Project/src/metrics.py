@@ -1,28 +1,38 @@
-"""Evaluation metrics.
+"""Scoring. Macro averages are the default here, and that is a decision.
 
-Accuracy alone is a poor summary for a medical classifier: it hides which
-class is being missed, and a miss is not symmetric — calling a tumour healthy
-costs more than the reverse. Everything here reports per class.
+Cleaning the dataset in Phase 1 left the classes uneven -- notumor lost the most,
+because its source collection spread each subject's slices across both shipped
+folders, so removing same-patient bleed removed more of that class than of any
+other. The test set runs from 88 notumor images to 375 glioma.
+
+Plain accuracy on an imbalanced test set is a weighted average that hides the
+small classes. A model that handled the three large classes well and failed
+notumor entirely would still post a respectable figure. Macro averaging weights
+every class equally, so the failure shows.
 """
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+from sklearn.metrics import confusion_matrix
 
 from .config import DEVICE
 
 
-@torch.no_grad()
 def predict(model, loader):
-    """Run the model over a loader, returning true labels, predictions and probabilities."""
+    """True labels, predictions and probabilities for a whole loader.
+
+    model.eval() is not optional and not cosmetic: with BatchNorm in training
+    mode a batch is normalised by its own statistics, and on small batches that
+    alone can drop accuracy from 0.97 to near chance.
+    """
     model.eval()
     y_true, y_pred, probs = [], [], []
-    for images, targets in loader:
-        logits = model(images.to(DEVICE))
-        p = F.softmax(logits, dim=1)
-        y_true.append(targets.numpy())
-        y_pred.append(logits.argmax(1).cpu().numpy())
-        probs.append(p.cpu().numpy())
+    with torch.no_grad():
+        for images, targets in loader:
+            logits = model(images.to(DEVICE))
+            y_true.append(targets.numpy())
+            y_pred.append(logits.argmax(1).cpu().numpy())
+            probs.append(F.softmax(logits, dim=1).cpu().numpy())
     return (np.concatenate(y_true), np.concatenate(y_pred), np.concatenate(probs))
 
 
@@ -31,67 +41,75 @@ def confusion(y_true, y_pred, n_classes=4):
 
 
 def per_class_report(y_true, y_pred, classes):
-    """Precision, recall, F1 and support per class, plus macro and weighted means.
+    """Precision, recall and F1 per class, plus macro and weighted averages.
 
-    Recall is the one to read first here: it answers 'of the scans that really
-    were this class, how many did we catch', which is the question a missed
-    diagnosis turns on.
+    Precision answers "of the scans we called glioma, how many were" -- the
+    number that matters for unnecessary follow-up. Recall answers "of the scans
+    that really were glioma, how many we caught" -- the number that matters
+    clinically, because its complement is the missed-diagnosis rate. F1 is their
+    harmonic mean, which punishes buying one by sacrificing the other.
     """
-    cm = confusion(y_true, y_pred, len(classes))
     rows = []
-    for i, name in enumerate(classes):
-        tp = cm[i, i]
-        support   = cm[i].sum()
-        precision = tp / cm[:, i].sum() if cm[:, i].sum() else 0.0
-        recall    = tp / support if support else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-        rows.append({"class": name, "precision": precision, "recall": recall,
-                     "f1": f1, "support": int(support)})
+    for c, name in enumerate(classes):
+        tp = int(((y_pred == c) & (y_true == c)).sum())
+        fp = int(((y_pred == c) & (y_true != c)).sum())
+        fn = int(((y_pred != c) & (y_true == c)).sum())
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec  = tp / (tp + fn) if tp + fn else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+        rows.append({"class": name, "precision": prec, "recall": rec,
+                     "f1": f1, "support": int((y_true == c).sum())})
 
     support = np.array([r["support"] for r in rows], dtype=float)
-    for name, w in (("macro avg", None), ("weighted avg", support / support.sum())):
-        rows.append({"class": name,
-                     "precision": np.average([r["precision"] for r in rows[:len(classes)]], weights=w),
-                     "recall":    np.average([r["recall"]    for r in rows[:len(classes)]], weights=w),
-                     "f1":        np.average([r["f1"]        for r in rows[:len(classes)]], weights=w),
+    for tag, weights in (("macro avg", np.ones_like(support)),
+                         ("weighted avg", support)):
+        w = weights / weights.sum()
+        rows.append({"class": tag,
+                     "precision": float(np.dot(w, [r["precision"] for r in rows[:len(classes)]])),
+                     "recall":    float(np.dot(w, [r["recall"] for r in rows[:len(classes)]])),
+                     "f1":        float(np.dot(w, [r["f1"] for r in rows[:len(classes)]])),
                      "support":   int(support.sum())})
     return rows
 
 
+def macro_f1(y_true, y_pred, n_classes=4):
+    """Macro F1 as a single number, for model selection."""
+    scores = []
+    for c in range(n_classes):
+        tp = ((y_pred == c) & (y_true == c)).sum()
+        fp = ((y_pred == c) & (y_true != c)).sum()
+        fn = ((y_pred != c) & (y_true == c)).sum()
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec  = tp / (tp + fn) if tp + fn else 0.0
+        scores.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    return float(np.mean(scores))
+
+
 def print_report(rows):
-    print(f"{'class':<14}{'precision':>11}{'recall':>9}{'f1':>9}{'support':>9}")
-    print("-" * 52)
+    print(f"{'class':<16}{'precision':>11}{'recall':>9}{'f1':>9}{'support':>9}")
+    print("-" * 54)
     for r in rows:
         if r["class"] == "macro avg":
-            print("-" * 52)
-        print(f"{r['class']:<14}{r['precision']:>11.4f}{r['recall']:>9.4f}"
+            print("-" * 54)
+        print(f"{r['class']:<16}{r['precision']:>11.4f}{r['recall']:>9.4f}"
               f"{r['f1']:>9.4f}{r['support']:>9}")
 
 
-def roc_ovr(y_true, probs, n_classes=4):
-    """One-vs-rest ROC curves and AUCs, plus the macro-average AUC."""
-    curves, aucs = {}, {}
-    for i in range(n_classes):
-        binary = (y_true == i).astype(int)
-        fpr, tpr, _ = roc_curve(binary, probs[:, i])
-        curves[i] = (fpr, tpr)
-        aucs[i]   = roc_auc_score(binary, probs[:, i])
-    macro = roc_auc_score(y_true, probs, multi_class="ovr", average="macro")
-    return curves, aucs, macro
+def bootstrap_ci(y_true, y_pred, metric="accuracy", class_idx=None, n_classes=4,
+                 n_boot=1000, seed=0):
+    """95% interval by resampling the test set with replacement.
 
-
-def bootstrap_ci(y_true, y_pred, class_idx=None, n_boot=1000, seed=0):
-    """95% confidence interval for accuracy (or one class's recall) by resampling.
-
-    A single accuracy figure on 1,497 test images is a point estimate with real
-    uncertainty attached. Resampling the test set with replacement shows how
-    much of the number is signal and how much is which images happened to be
-    in the split.
+    A single figure computed on one particular sample of held-out images is a
+    point estimate with real uncertainty attached, and quoting it to four
+    decimal places implies a precision the sample size does not support.
     """
     rng = np.random.default_rng(seed)
     if class_idx is None:
         pool = np.arange(len(y_true))
-        score = lambda s: (y_true[s] == y_pred[s]).mean()
+        if metric == "macro_f1":
+            score = lambda s: macro_f1(y_true[s], y_pred[s], n_classes)
+        else:
+            score = lambda s: (y_true[s] == y_pred[s]).mean()
     else:
         pool = np.where(y_true == class_idx)[0]
         score = lambda s: (y_pred[s] == class_idx).mean()
@@ -99,3 +117,13 @@ def bootstrap_ci(y_true, y_pred, class_idx=None, n_boot=1000, seed=0):
     stats = np.array([score(rng.choice(pool, len(pool), replace=True))
                       for _ in range(n_boot)])
     return score(pool), float(np.percentile(stats, 2.5)), float(np.percentile(stats, 97.5))
+
+
+def roc_ovr(y_true, probs, n_classes=4):
+    """One-vs-rest ROC curves and AUCs, plus the macro average."""
+    from sklearn.metrics import auc, roc_curve
+    curves, aucs = [], []
+    for c in range(n_classes):
+        fpr, tpr, _ = roc_curve((y_true == c).astype(int), probs[:, c])
+        curves.append((fpr, tpr)); aucs.append(auc(fpr, tpr))
+    return curves, aucs, float(np.mean(aucs))

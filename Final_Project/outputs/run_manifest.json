@@ -1,0 +1,44 @@
+{
+  "written": "2026-09-01T22:19:16",
+  "git_sha": "d4977ce",
+  "dataset": "masoudnickparvar/brain-tumor-mri-dataset",
+  "dataset_hash": "64bfb6cb1bb9a8f6",
+  "split_hash": "053deb1b6524f6ca",
+  "classes": [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary"
+  ],
+  "config": {
+    "IMG_SIZE": 128,
+    "CACHE_SIZE": 224,
+    "VAL_FRAC": 0.15,
+    "BATCH_SIZE": 32,
+    "DUP_COSINE": 0.995,
+    "DUP_L1": 0.15,
+    "STRICT_LEAK": true,
+    "STRICT_LEAK_COSINE": 0.95,
+    "DEDUPE_TRAIN": true,
+    "BALANCE": "weights",
+    "EPOCHS": 60,
+    "LR": 0.001,
+    "WD": 0.0001,
+    "DROPOUT": 0.4,
+    "SEED": 42,
+    "PATIENCE": 25,
+    "FACE": "#F8F8F6"
+  },
+  "audit_failed": [
+    "metadata probe near chance",
+    "no class separable by size",
+    "no cross-split repeats"
+  ],
+  "metadata_probe_lift": 0.3658,
+  "train_dropped": 572,
+  "test_dropped": 470,
+  "n_train": 4224,
+  "n_val": 704,
+  "n_test": 1027,
+  "hash": "0ec49f71495d"
+}

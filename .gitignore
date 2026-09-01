@@ -1,6 +1,0 @@
-# 178 MB of Kaggle MRI data — re-downloadable, do not commit
-Final_Project/data/
-
-*.pth
-__pycache__/
-.ipynb_checkpoints/
