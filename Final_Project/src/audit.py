@@ -1,24 +1,18 @@
 """Dataset audit, run before anything is trained.
 
-One question: can something other than the anatomy predict the label?
+One question: can something other than anatomy predict the label?
 
-It runs first because the alternative was tried. In an earlier version of this
-project a model was trained, evaluated, written up, and only then found to be
-reading a source signature -- image resolution correlated almost perfectly with
-class, because the tumour classes and the healthy class came from different
-source collections digitised at different sizes. Accuracy was 0.9764 on the
-scans where that cue pointed the right way and 0.8019 on the rest, and no split
-and no augmentation repaired it, because the training data contained no examples
-of one class in the other's style.
+It runs first because the alternative was tried. A previous model was trained,
+evaluated, written up, and only then found to be reading a source signature --
+resolution correlated almost perfectly with class, giving 0.9764 where the cue
+pointed the right way and 0.8019 elsewhere. No split and no augmentation
+repaired it, because the training data held no examples of one class in the
+other's style.
 
-The decisive check is the last one. If a classifier that never sees a pixel --
-only width, height, file size and compression -- beats chance, then the labels
-are partly recoverable from the files themselves, and whatever the CNN reports
-is partly a measurement of that.
-
-On this dataset the probe is *expected to fail*. That is the point: the failure
-is recorded before training rather than discovered afterwards, and evaluation
-stratifies by the offending variable so the shortcut stays visible.
+Under Cheng only texture_features/texture_probe apply. Everything above them
+probes JPEG file metadata and belongs to the old ImageFolder layout; .mat files
+have no such metadata, and it would separate sources perfectly without any of
+it reaching the model.
 """
 import hashlib
 from collections import Counter, defaultdict
@@ -33,9 +27,8 @@ from sklearn.model_selection import cross_val_score
 def scan(root, drop_augmented=True):
     """Per-file metadata, without decoding pixels.
 
-    PIL reads the JPEG header for .size and .quantization, so this stays cheap.
-    Nothing here touches image content -- that is the point, since everything
-    collected is information a model should not be able to use.
+    Nothing here touches content -- everything collected is information a model
+    should not be able to use.
     """
     records = []
     for cls_dir in sorted(p for p in Path(root).iterdir() if p.is_dir()):
@@ -74,11 +67,10 @@ def report_resolution(records, classes):
 
 
 def report_signature(records, classes):
-    """A2 -- do the JPEG encoder settings cluster by class?
+    """A2 -- do JPEG encoder settings cluster by class?
 
-    Resizing hides the dimensions but not the compression history. If one class
-    was written by a different pipeline its quantization tables differ, and that
-    is a per-class watermark readable straight out of the texture.
+    Resizing hides dimensions but not compression history: a class written by a
+    different pipeline carries different quantization tables.
     """
     print("\nA2  JPEG quantization tables and bytes-per-pixel by class")
     tables = defaultdict(Counter)
@@ -119,13 +111,9 @@ def report_duplicates(train_cache, test_cache, train_lab, test_lab, classes):
 def metadata_probe(records, classes, seed=42):
     """A4 -- can the label be predicted from metadata alone?
 
-    A random forest on width, height, file size and bytes-per-pixel. It never
-    sees a pixel, so anything above chance means the label leaks through the
-    file itself, and the CNN will find that signal faster than it finds anatomy.
-
-    A forest rather than a linear model deliberately: the shortcut here is a
-    threshold ("is it 512x512"), which a tree splits out immediately and a
-    linear model on raw sizes can miss.
+    A forest on width, height, file size and bpp -- never a pixel, so anything
+    above chance means the label leaks through the file. A forest because the
+    shortcut is a threshold ("is it 512x512") that a tree splits out at once.
     """
     print("\nA4  metadata-only probe (no pixels)")
     X = np.array([[r["width"], r["height"], r["filesize"], r["bpp"]]
@@ -149,8 +137,8 @@ def run_audit(train_dir, test_dir, classes, train_cache=None, test_cache=None,
               train_lab=None, test_lab=None):
     """Run every check and return the findings with a verdict.
 
-    The verdict is strict on purpose. It is easier to argue down a failed check
-    now than to explain a headline number later.
+    Strict on purpose: easier to argue down a failed check now than a headline
+    number later.
     """
     records = scan(train_dir) + scan(test_dir)
     print("=" * 68)
@@ -181,3 +169,45 @@ def run_audit(train_dir, test_dir, classes, train_cache=None, test_cache=None,
         print("     shortcut cannot be removed, so evaluation reports every")
         print("     headline number beside its size-stratified breakdown.")
     return res
+
+
+def texture_features(images):
+    """Per-image statistics of the kind a source signature hides in.
+
+    File properties are the wrong probe once sources share a cache -- .mat
+    against .jpg separates them perfectly and none of it reaches the model.
+    These capture acquisition and resampling history: brightness, contrast,
+    Laplacian sharpness, gradient energy, high-frequency share.
+    """
+    feats = []
+    for a in images:
+        x = a.astype(np.float32) / 255.0
+        lap = (x[2:, 1:-1] + x[:-2, 1:-1] + x[1:-1, 2:] + x[1:-1, :-2]
+               - 4 * x[1:-1, 1:-1])
+        gy, gx = np.gradient(x)
+        f = np.abs(np.fft.rfft2(x))
+        half = f.shape[0] // 2
+        feats.append([x.mean(), x.std(), lap.var(),
+                      np.hypot(gx, gy).mean(),
+                      f[half:].sum() / max(f.sum(), 1e-8)])
+    return np.array(feats, dtype=np.float64)
+
+
+def texture_probe(images, labels, classes, seed=42, label="texture probe"):
+    """Can class be predicted from pixel statistics alone, ignoring anatomy?
+
+    A forest on the five features above -- no spatial structure, no shapes, no
+    lesions. Much above chance means class is partly encoded in how the image
+    was acquired and resampled rather than in what it shows.
+    """
+    X = texture_features(images)
+    y = np.asarray(labels)
+    clf = RandomForestClassifier(n_estimators=300, random_state=seed, n_jobs=-1)
+    scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
+    chance = 1.0 / len(classes)
+    acc = float(scores.mean())
+    clf.fit(X, y)
+    names = ["mean", "std", "laplacian var", "gradient", "high-freq share"]
+    top = names[int(np.argmax(clf.feature_importances_))]
+    print(f"  {label:<34}{acc:>8.4f}{chance:>9.4f}{acc - chance:>+9.4f}   top: {top}")
+    return {"accuracy": acc, "chance": chance, "lift": acc - chance}

@@ -1,20 +1,15 @@
 """Training loop, checkpointing, and one-shot experiments.
 
-Two decisions in here are worth reading before the code.
+Early stopping is a runaway guard, not model selection: the checkpoint already
+keeps the best-validation-loss epoch, so stopping early can only forfeit later
+improvement. Patience 8 once cut a 60-epoch cosine schedule at epoch 20 and cost
+four points of accuracy.
 
-Early stopping cannot improve model selection. The checkpoint already keeps the
-best-validation-loss epoch, so stopping early can only forfeit improvement that
-would have come later -- it never picks a better model, it only saves time. That
-makes it a runaway guard, and its patience should be generous. A tight patience
-previously halted a 60-epoch cosine schedule at epoch 20, before the low
-learning-rate phase where the best epoch actually appears, and cost four points
-of accuracy that were simply left on the table.
-
-The scheduler steps once per epoch, not once per batch. Stepping per batch
-completes the whole cosine cycle inside the first epoch and leaves everything
-after it training at eta_min -- a silent failure that looks exactly like a model
-which stopped improving.
+The scheduler steps per epoch, not per batch. Per batch finishes the cosine
+cycle inside epoch one and leaves the rest at eta_min -- a silent failure that
+looks exactly like a model that stopped improving.
 """
+import random
 import time
 
 import numpy as np
@@ -37,8 +32,8 @@ def train_one_epoch(model, loader, criterion, optimizer):
         logits = model(images)
         loss = criterion(logits, targets)
         loss.backward()
-        # Clipping is cheap insurance rather than a tuned hyperparameter: a
-        # single exploding batch early on can undo an epoch of progress.
+        # cheap insurance, not a tuned hyperparameter: one exploding batch
+        # early on can undo an epoch of progress
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * len(targets)
@@ -173,11 +168,9 @@ def build_loaders(cache, labels, train_idx, val_idx, mean, std, *,
                   balance=BALANCE, batch_size=BATCH_SIZE, seed=SEED):
     """Loaders plus the class weight implied by the balancing choice.
 
-    Returns (train_loader, val_loader, class_weight). Only one correction is
-    ever applied: 'weights' returns a weight vector and an ordinary shuffled
-    loader, 'sampler' returns a balanced sampler and no weight, 'undersample'
-    truncates the index list. Applying two of them at once would correct the
-    same imbalance twice.
+    Exactly one correction is applied: 'weights' returns a weight vector,
+    'sampler' a balanced sampler, 'undersample' a truncated index list. Two at
+    once would correct the same imbalance twice.
     """
     train_tf = make_transforms(mean, std, augment=augment, img_size=img_size,
                                jitter=jitter, corrupt=corrupt)
@@ -201,6 +194,15 @@ def build_loaders(cache, labels, train_idx, val_idx, mean, std, *,
             train_ds, batch_size, sampler=sampler, num_workers=0, drop_last=True)
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size, shuffle=False, num_workers=0)
+
+    # drop_last=True yields no batches when the split is smaller than one
+    # batch, surfacing as a ZeroDivisionError deep in the epoch loop that names
+    # neither cause nor caller. Small-subset controls hit this exactly.
+    if len(train_loader) == 0:
+        raise ValueError(
+            f"training loader is empty: {len(train_ds)} images at batch_size "
+            f"{batch_size} with drop_last=True gives no batches. Pass a smaller "
+            f"batch_size or more images.")
     return train_loader, val_loader, weight
 
 
@@ -212,13 +214,18 @@ def run_experiment(cache, labels, train_idx, val_idx, mean, std, *, dropout=0.0,
                    verbose=False):
     """Train one configuration end to end and return its history.
 
-    Everything the run depends on is an argument, so two calls with the same
-    arguments give the same numbers and no call can be changed by editing an
-    unrelated cell. Early stopping is off by default so every ablation
-    configuration is compared over an identical number of epochs.
+    Everything it depends on is an argument, so equal arguments give equal
+    numbers. Early stopping is off by default, so every ablation configuration
+    gets an identical epoch budget.
     """
+    # Three generators because three are used: torch for weight init and
+    # torchvision transforms, numpy for index selection, stdlib random for
+    # RandomBlur/RandomNoise. Seeding only the first two left corrupt=True runs
+    # non-reproducible -- the corruption row moved 0.0154 macro F1 between
+    # identical invocations, against a 0.0168 signal threshold.
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
     train_loader, val_loader, weight = build_loaders(
         cache, labels, train_idx, val_idx, mean, std, augment=augment,

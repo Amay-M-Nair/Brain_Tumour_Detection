@@ -1,10 +1,9 @@
-"""Figures. Every one is stamped with the run that produced it.
+"""Figures, each stamped with the run that produced it.
 
-The stamp is small and in the corner, and it is there because two figures from
-two different checkpoints once sat in an outputs folder looking equally
-authoritative and disagreeing with each other. Reconciling them took longer than
-the analysis they belonged to. A figure whose stamp does not match
-outputs/run_manifest.json was made by a different run.
+Two figures from two different checkpoints once sat in an outputs folder looking
+equally authoritative and disagreeing; reconciling them took longer than the
+analysis. A figure whose stamp does not match outputs/run_manifest.json was made
+by a different run.
 """
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,10 +37,8 @@ def show_batch(dataset, classes, mean, std, n=8, name="sample_batch.png",
                title="Training samples"):
     """A batch after the full pipeline.
 
-    Every figure in this project is produced by code that could be wrong in a
-    way that still runs. Plotting a batch after cache, crop, resize, augment,
-    normalise and denormalise is the cheapest check that labels still line up
-    with images and nothing was silently corrupted.
+    The cheapest check that cache, crop, resize, augment and normalise did not
+    silently corrupt anything or desync labels from images.
     """
     fig, axes = styled_fig(2, n // 2, figsize=(1.7 * n // 2, 4))
     for ax, i in zip(axes.ravel(), np.linspace(0, len(dataset) - 1, n).astype(int)):
@@ -69,10 +66,9 @@ def plot_class_balance(counts, classes, name="class_balance.png",
 
 def plot_pairs(rows, name="leakage_examples.png",
                title="Same scans on both sides of the shipped split"):
-    """Query/match image pairs, laid out one band per block.
+    """Query/match image pairs, one band per block.
 
-    `rows` is a list of (band_title, [(query_img, query_label, match_img,
-    match_label, caption), ...]).
+    `rows`: [(band_title, [(q_img, q_label, m_img, m_label, caption), ...])].
     """
     n_band = len(rows)
     n_col = max(len(r[1]) for r in rows)
@@ -97,11 +93,9 @@ def plot_pairs(rows, name="leakage_examples.png",
 def plot_curves(history, name="training_curves.png", title="Training dynamics"):
     """Loss, accuracy and learning rate over the run.
 
-    The learning-rate panel is not decoration. A cosine schedule stepped per
-    batch instead of per epoch completes its whole cycle inside the first epoch
-    and leaves everything after it at eta_min, which looks identical to a model
-    that simply stopped improving. Plotting the rate makes that visible instead
-    of leaving it to be inferred from a flat loss curve.
+    The LR panel is not decoration: a cosine schedule stepped per batch finishes
+    its cycle inside epoch one and leaves the rest at eta_min, which looks
+    identical to a model that stopped improving.
     """
     ep = range(1, len(history["train_loss"]) + 1)
     fig, axes = styled_fig(1, 3, figsize=(15, 4))
@@ -127,9 +121,8 @@ def plot_curves(history, name="training_curves.png", title="Training dynamics"):
 def plot_confusion(cm, classes, name="confusion_matrix.png"):
     """Counts alongside row-normalised recall.
 
-    The normalised panel is the one to read. With uneven classes the raw counts
-    are dominated by the large ones, but a row that sends 8% of its scans
-    elsewhere is obvious once every row sums to one.
+    Read the normalised panel: raw counts are dominated by the large classes,
+    but a row leaking 8% elsewhere is obvious once every row sums to one.
     """
     norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
     fig, axes = styled_fig(1, 2, figsize=(12, 5))

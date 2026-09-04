@@ -1,0 +1,11 @@
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+numpy==2.3.4
+scipy==1.17.0
+scikit-learn==1.8.0
+matplotlib==3.10.7
+Pillow==12.0.0
+h5py==3.16.0
+grad-cam==1.5.5
+kagglehub==1.0.2
+jupyter==1.1.1

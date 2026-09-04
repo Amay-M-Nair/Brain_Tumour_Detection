@@ -2,12 +2,9 @@
 
 Dataset digest, split digest, config, git SHA, timestamp. The short hash is
 stamped on every figure and embedded in every checkpoint, so a figure and a
-model can be checked against each other instead of being assumed to match.
-
-This exists because they once did not match, silently: a ROC curve and an
-attention figure in the same folder turned out to come from two different
-checkpoints several hours and one reverted notebook apart, and nothing on disk
-said so.
+model can be checked against each other rather than assumed to match. They once
+did not, silently: a ROC curve and an attention figure from two checkpoints
+several hours and one reverted notebook apart, with nothing on disk saying so.
 """
 import hashlib
 import json
@@ -19,7 +16,7 @@ from .config import MANIFEST_PATH
 
 
 def _git_sha():
-    """Current commit, or 'unknown'. Never raises -- a missing SHA must not be
+    """Current commit, or 'unknown'. Never raises: a missing SHA must not be
     able to fail a run."""
     try:
         return subprocess.check_output(
@@ -31,7 +28,7 @@ def _git_sha():
 
 def _config_snapshot():
     """Every upper-case scalar in config.py -- the knobs, without the paths."""
-    skip = {"CLASSES", "KAGGLE_DATASET"}
+    skip = {"CLASSES", "DATASET"}
     return {k: v for k, v in vars(config).items()
             if k.isupper() and k not in skip and isinstance(v, (int, float, str, bool))}
 
@@ -39,13 +36,13 @@ def _config_snapshot():
 def write(dataset_hash, split_hash, extra=None):
     """Write run_manifest.json and return its short hash.
 
-    The hash is computed from the manifest's content rather than assigned, so
-    two different runs cannot share a stamp.
+    Computed from the content rather than assigned, so two different runs cannot
+    share a stamp.
     """
     body = {
         "written":      datetime.now().isoformat(timespec="seconds"),
         "git_sha":      _git_sha(),
-        "dataset":      config.KAGGLE_DATASET,
+        "dataset":      config.DATASET,
         "dataset_hash": dataset_hash,
         "split_hash":   split_hash,
         "classes":      list(config.CLASSES),

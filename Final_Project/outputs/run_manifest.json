@@ -1,27 +1,24 @@
 {
-  "written": "2026-09-01T22:19:16",
-  "git_sha": "d4977ce",
-  "dataset": "masoudnickparvar/brain-tumor-mri-dataset",
-  "dataset_hash": "64bfb6cb1bb9a8f6",
-  "split_hash": "053deb1b6524f6ca",
+  "written": "2026-09-03T01:11:26",
+  "git_sha": "6f87377",
+  "dataset": "figshare-cheng-2017",
+  "dataset_hash": "bc41cbf1f869ebb1",
+  "split_hash": "02b0799a48a71b69",
   "classes": [
     "glioma",
     "meningioma",
-    "notumor",
     "pituitary"
   ],
   "config": {
     "IMG_SIZE": 128,
     "CACHE_SIZE": 224,
     "VAL_FRAC": 0.15,
+    "TEST_FRAC": 0.2,
     "BATCH_SIZE": 32,
     "DUP_COSINE": 0.995,
     "DUP_L1": 0.15,
-    "STRICT_LEAK": true,
-    "STRICT_LEAK_COSINE": 0.95,
-    "DEDUPE_TRAIN": true,
     "BALANCE": "weights",
-    "EPOCHS": 60,
+    "EPOCHS": 80,
     "LR": 0.001,
     "WD": 0.0001,
     "DROPOUT": 0.4,
@@ -29,16 +26,20 @@
     "PATIENCE": 25,
     "FACE": "#F8F8F6"
   },
-  "audit_failed": [
-    "metadata probe near chance",
-    "no class separable by size",
-    "no cross-split repeats"
-  ],
-  "metadata_probe_lift": 0.3658,
-  "train_dropped": 572,
-  "test_dropped": 470,
-  "n_train": 4224,
-  "n_val": 704,
-  "n_test": 1027,
-  "hash": "0ec49f71495d"
+  "equalise": false,
+  "n_images": 3064,
+  "n_patients": 233,
+  "split_sizes": {
+    "train": 2099,
+    "val": 352,
+    "test": 613
+  },
+  "patients_per_split": {
+    "train": 159,
+    "val": 27,
+    "test": 47
+  },
+  "texture_probe_patientwise": 0.6691,
+  "anatomy_oracle_patientwise": 0.7063,
+  "hash": "b9dcd147c12e"
 }

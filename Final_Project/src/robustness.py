@@ -1,21 +1,18 @@
 """How far does the accuracy travel outside this dataset's conditions?
 
-The standard objection to a high accuracy on a curated public MRI benchmark is
-not that it is fabricated, it is that the benchmark is clean in ways a hospital
-is not. A model trained on uniformly sharp, consistently windowed images can
-learn to depend on that, and no ordinary evaluation reveals the dependence,
-because the test split is clean in exactly the same ways.
+The objection to a high accuracy on a curated MRI benchmark is not that it is
+fabricated, it is that the benchmark is clean in ways a hospital is not, and no
+ordinary evaluation reveals a dependence on that because the test split is clean
+in the same ways.
 
-So the test set is degraded and scored again. This is not external validation
-and does not pretend to be -- simulating another site properly needs another
-site's data. It answers a narrower question honestly: does the accuracy survive
-the variation that separates one scanner from another?
+So the test set is degraded and scored again. Not external validation -- that
+needs another site's data -- but an honest answer to a narrower question: does
+the accuracy survive the variation that separates one scanner from another?
 
-The corruptions are the families that actually differ between acquisitions
-rather than a generic benchmark: noise for field strength and acquisition time,
-blur for slice thickness and motion, gamma for windowing conventions that are
-not standardised between sites, and a bias field for the smooth B1
-inhomogeneity that is specific to MRI.
+The corruptions are families that actually differ between acquisitions: noise
+for field strength and acquisition time, blur for slice thickness and motion,
+gamma for non-standardised windowing, and a bias field for the smooth B1
+inhomogeneity specific to MRI.
 """
 import numpy as np
 import torch
@@ -59,7 +56,7 @@ def corruptions(seed=0):
             ("bias field +/-20%", lambda a: add_bias_field(a, 0.20))]
 
 
-def robustness_test(model, cache, labels, mean, std, img_size, n_classes=4,
+def robustness_test(model, cache, labels, mean, std, img_size, n_classes=3,
                     batch_size=64, seed=0):
     """Accuracy and macro F1 on the clean test set and under each corruption."""
     tf = make_transforms(mean, std, augment=False, img_size=img_size)

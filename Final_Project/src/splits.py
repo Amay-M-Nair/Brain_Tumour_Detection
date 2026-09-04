@@ -1,30 +1,26 @@
 """The one place a split is constructed, and where leakage is removed.
 
-Logic that decides what the model is measured against does not belong in a
-notebook cell. In an earlier version it did, and a stale editor tab wrote an
-older copy of that notebook back to disk, silently reverting the split to a
-leaky one. The training run that followed looked entirely normal and reported a
-better number, which is what a silent regression looks like.
+Split logic does not belong in a notebook cell: it lived there once, a stale
+editor tab wrote an older copy back to disk, and the run that followed looked
+entirely normal while reporting a better number.
 
-The requirement this module carries is that `Training/` and `Testing/` share no
-images. On this dataset that is not the default: 293 of the shipped test images
-are pixel-identical to training images under different filenames. Those are
-found, removed, and then their absence is asserted -- leakage is not written up
-as a caveat, it is eliminated and the elimination is checked.
-
-What cannot be eliminated is patient identity. This dataset ships no patient
-IDs, so two different slices of one patient are invisible to a pixel comparison
-and may still sit on both sides. `leak_report` bounds that residual rather than
-ignoring it.
+Cheng ships a patient ID per slice, so same-patient bleed -- undetectable by any
+pixel comparison, and only boundable on the previous dataset -- is preventable.
+Patients are the grouping unit and no patient crosses a boundary; asserted, not
+hoped for. The old STRICT_LEAK cosine threshold guessed at patient identity from
+near-neighbours and is gone: the metadata exists, so the guess is replaced.
 """
 import hashlib
 from pathlib import Path
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from sklearn.model_selection import StratifiedGroupKFold
 
-from .config import (CACHE_DIR, DEDUPE_TRAIN, DUP_COSINE, DUP_L1, SEED,
-                     STRICT_LEAK, STRICT_LEAK_COSINE, VAL_FRAC)
-from .data import build_cache, duplicate_groups, find_duplicates, grouped_split
+from .config import (CLASSES, DUP_COSINE, DUP_L1, SEED, TEST_FRAC,
+                     VAL_FRAC)
+from .data import duplicate_groups, find_duplicates
 
 
 def _hash(*arrays):
@@ -35,173 +31,189 @@ def _hash(*arrays):
     return h.hexdigest()[:16]
 
 
-def build_caches(train_dir, test_dir, rebuild=False):
-    """Decode both splits once and memoise them under data/cache.
+def build_dataset(cheng_dir, classes=None, equalise=False):
+    """Load Cheng into one cache, with patient groups and tumour masks.
 
-    Returns pixels, labels, paths and the class list for each split. The
-    augmented copies are dropped from *both* splits here, not just Testing.
+    Returns a dict of images, labels, group ids, masks and file names. Groups
+    are the real patient ID, which is the whole reason this dataset was worth
+    moving to: a split can finally separate patients rather than slices.
+
+    `equalise` defaults off: measured, it removes 0.005 of a 0.3187 texture lift
+    while costing real resolution. The switch stays so it can be re-measured.
+
+    Nothing is cached. Reading 3,064 HDF5 files takes ~20s and the result is a
+    pure function of the .mat files, so a cache buys little and costs
+    correctness -- a stale .npz is indistinguishable from a fresh one at the
+    call site. The manifest catches that after the fact; not caching prevents it.
     """
-    files = {n: CACHE_DIR / f"{n}.npy" for n in
-             ("train_img", "train_lab", "test_img", "test_lab")}
-    paths_file = CACHE_DIR / "paths.npz"
+    from .sources import load_cheng
 
-    if not rebuild and all(f.exists() for f in files.values()) and paths_file.exists():
-        a = {n: np.load(f) for n, f in files.items()}
-        p = np.load(paths_file, allow_pickle=True)
-        return (a["train_img"], a["train_lab"], list(p["train"]),
-                a["test_img"], a["test_lab"], list(p["test"]), list(p["classes"]))
+    classes = classes or list(CLASSES)
+    images, lab, pids, masks, names = load_cheng(cheng_dir, equalise_first=equalise)
+    labels = np.array([classes.index(l) for l in lab], dtype=np.int64)
 
-    tr_img, tr_lab, classes, tr_paths = build_cache(train_dir)
-    te_img, te_lab, te_classes, te_paths = build_cache(test_dir)
-    assert classes == te_classes, "Training/ and Testing/ disagree on class order"
+    pid_index = {p: i for i, p in enumerate(sorted(set(pids)))}
+    groups = np.array([pid_index[p] for p in pids], dtype=np.int64)
 
-    np.save(files["train_img"], tr_img); np.save(files["train_lab"], tr_lab)
-    np.save(files["test_img"], te_img);  np.save(files["test_lab"], te_lab)
-    np.savez(paths_file, train=np.array(tr_paths, dtype=object),
-             test=np.array(te_paths, dtype=object),
-             classes=np.array(classes, dtype=object))
-    return tr_img, tr_lab, tr_paths, te_img, te_lab, te_paths, classes
+    return {"images": images, "labels": labels, "groups": groups, "masks": masks,
+            "names": np.array(names, dtype=object),
+            "pids": np.array(pids, dtype=object),
+            "n_patients": np.array(len(pid_index))}
 
 
-def build_splits(train_img, train_lab, test_img, val_frac=VAL_FRAC, seed=SEED,
-                 rebuild=False):
-    """Grouped train/val indices plus the cross-split leak mask.
+def merge_groups_by_duplicate(images, groups, cos_thresh=DUP_COSINE,
+                              l1_thresh=DUP_L1):
+    """Fuse patient groups that share a duplicated scan.
 
-    train_idx / val_idx -- whole duplicate clusters land on one side, so the
-    validation number cannot be inflated by scoring the model on a scan it
-    memorised.
+    Patient grouping closes the leak only if IDs are consistent. One scan filed
+    under two identifiers looks like two independent patients, and the split is
+    then free to put one on each side.
 
-    test_leak -- test images that repeat a training scan. Everything downstream
-    excludes them, and Phase 1 asserts that nothing survives the exclusion.
+    Returns merged groups, duplicate cluster ids, and the merge count --
+    reported rather than hidden, since a non-zero value says something real.
     """
-    cached = CACHE_DIR / "splits.npz"
-    if not rebuild and cached.exists():
-        d = np.load(cached)
-        out = {k: d[k] for k in d.files}
-        out["split_hash"] = str(out["split_hash"])
-        return out
+    dup = duplicate_groups(images, cos_thresh=cos_thresh, l1_thresh=l1_thresh)
+    n = int(groups.max()) + 1
+    rows, cols = [], []
+    for cluster in np.unique(dup):
+        members = np.unique(groups[dup == cluster])
+        for other in members[1:]:
+            rows.append(members[0])
+            cols.append(other)
+    if rows:
+        graph = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+        n_merged, relabel = connected_components(graph, directed=False)
+    else:
+        n_merged, relabel = n, np.arange(n)
+    return relabel[groups], dup, int(n - n_merged)
 
-    # Cluster at the strict threshold, not the duplicate threshold. The
-    # train/val boundary needs the same rule the test set gets: grouping only
-    # exact duplicates leaves same-patient adjacent slices free to straddle it,
-    # which is leakage into the number every training decision is made against.
-    # Connected components stay tight here because contrast_l1 <= 0.15 still
-    # has to hold -- measured, the largest cluster is 9 images even at 0.92.
-    split_cos = STRICT_LEAK_COSINE if STRICT_LEAK else DUP_COSINE
-    groups = duplicate_groups(train_img, cos_thresh=split_cos)
 
-    # 1. drop redundant copies inside Training/, keeping one image per cluster
-    train_keep = np.zeros(len(train_lab), dtype=bool)
-    _, first = np.unique(groups, return_index=True)
-    train_keep[first] = True
-    if not DEDUPE_TRAIN:
-        train_keep[:] = True
+def build_splits(images, labels, groups, test_frac=TEST_FRAC, val_frac=VAL_FRAC,
+                 seed=SEED):
+    """Patient-wise train/val/test indices over a single pool.
 
-    # 2. drop test images that match anything still in Training/. Matching
-    #    against the kept subset, not the original, so the exclusion describes
-    #    the data the model will actually see.
-    kept_idx = np.where(train_keep)[0]
-    test_leak, _, cos = find_duplicates(test_img, train_img[kept_idx])
-    if STRICT_LEAK:
-        # near-neighbours are not duplicates and no pixel test calls them one,
-        # but inspection showed same-patient adjacent slices, and 100% of pairs
-        # above this threshold share a class against a 77% baseline
-        test_leak = test_leak | (cos >= STRICT_LEAK_COSINE)
+    Cheng ships no train/test division, so one is drawn here -- twice, both
+    grouped by patient. Test is carved off first and never touched again, then
+    validation from the remainder; so TEST_FRAC is of everything and VAL_FRAC of
+    what is left.
 
-    # 3. drop repeats *inside* Testing/ as well. These do not leak between
-    #    splits, but a scan present twice is scored twice, so it silently gets
-    #    double weight in every metric.
-    test_groups = duplicate_groups(test_img, cos_thresh=split_cos)
-    seen = set()
-    for i, g in enumerate(test_groups):
-        if test_leak[i]:
-            continue
-        if g in seen:
-            test_leak[i] = True
-        else:
-            seen.add(g)
+    Exact repeats are thinned first. A scan present twice is not extra evidence:
+    in training it gets double weight in the loss, in test it is scored twice.
 
-    # 4. split what survives
-    train_idx, val_idx = grouped_split(train_lab[train_keep],
-                                       groups[train_keep], val_frac, seed)
-    train_idx, val_idx = kept_idx[train_idx], kept_idx[val_idx]
+    Not cached, like build_dataset: deterministic in its arguments and the seed,
+    so recomputing is always right and reloading only sometimes is.
+    """
+    merged, dup, n_merges = merge_groups_by_duplicate(images, groups)
 
-    assert not (set(groups[train_idx]) & set(groups[val_idx])), \
-        "a duplicate cluster straddles the train/val boundary"
+    # thin exact repeats: one image per duplicate cluster
+    keep = np.zeros(len(labels), dtype=bool)
+    _, first = np.unique(dup, return_index=True)
+    keep[first] = True
+    idx = np.where(keep)[0]
 
-    out = {"train_idx": train_idx, "val_idx": val_idx, "groups": groups,
-           "train_keep": train_keep, "test_leak": test_leak,
-           "test_cosine": cos,
-           "split_hash": _hash(train_idx, val_idx, test_leak)}
-    np.savez(cached, **out)
+    lab_k, grp_k = labels[idx], merged[idx]
+
+    # test first, from the whole pool
+    n_test = max(2, round(1 / test_frac))
+    tv_rel, te_rel = next(StratifiedGroupKFold(
+        n_test, shuffle=True, random_state=seed).split(
+            np.zeros(len(lab_k)), lab_k, grp_k))
+
+    # then validation, from what is left
+    n_val = max(2, round(1 / val_frac))
+    tr_sub, va_sub = next(StratifiedGroupKFold(
+        n_val, shuffle=True, random_state=seed).split(
+            np.zeros(len(tv_rel)), lab_k[tv_rel], grp_k[tv_rel]))
+
+    train_idx = idx[tv_rel[tr_sub]]
+    val_idx = idx[tv_rel[va_sub]]
+    test_idx = idx[te_rel]
+
+    out = {"train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx,
+           "keep": keep, "dup": dup, "merged_groups": merged,
+           "n_group_merges": np.array(n_merges),
+           "split_hash": _hash(train_idx, val_idx, test_idx)}
     return out
 
 
-def write_exclusions(train_paths, test_paths, S, path=None):
-    """Persist exactly which files were dropped and why, as a checkable record.
+def assert_patient_disjoint(groups, train_idx, val_idx, test_idx):
+    """The hard gate: no patient may appear in more than one split.
 
-    A count in a notebook cell is not auditable. This writes the filenames, so
-    the exclusion can be re-derived, diffed between runs, or argued with.
+    The claim the dataset change was made to be able to assert. Fails loudly
+    rather than returning a flag: a violation produces numbers that look better
+    and mean less.
     """
-    import json
-    from .config import OUTPUTS
-
-    path = path or OUTPUTS / "excluded.json"
-    keep = S["train_keep"]
-    body = {
-        "train_dropped_as_redundant": sorted(
-            Path(p).name for p, k in zip(train_paths, keep) if not k),
-        "test_dropped_as_leaked": sorted(
-            Path(p).name for p, k in zip(test_paths, S["test_leak"]) if k),
-        "rule": {"duplicate_cosine": float(DUP_COSINE),
-                 "duplicate_pixel_l1": float(DUP_L1),
-                 "strict_leak": bool(STRICT_LEAK),
-                 "strict_leak_cosine": float(STRICT_LEAK_COSINE),
-                 "dedupe_train": bool(DEDUPE_TRAIN)},
-    }
-    body["counts"] = {k: len(v) for k, v in body.items() if isinstance(v, list)}
-    path.write_text(json.dumps(body, indent=2), encoding="utf-8")
-    return body
+    sets = {"train": set(groups[train_idx].tolist()),
+            "val": set(groups[val_idx].tolist()),
+            "test": set(groups[test_idx].tolist())}
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        shared = sets[a] & sets[b]
+        if shared:
+            raise AssertionError(
+                f"{len(shared)} patient group(s) appear in both {a} and {b} "
+                f"-- the split is not patient-wise: {sorted(shared)[:8]}")
+    return {k: len(v) for k, v in sets.items()}
 
 
-def assert_no_leakage(train_img, test_img, keep):
-    """The hard gate. Re-checks the *surviving* test set against training.
+def assert_no_leakage(images, train_idx, test_idx):
+    """Re-check test images against training, independently.
 
-    Deliberately independent of build_splits rather than reusing its result: the
-    point is to verify the exclusion actually worked, and a check that trusts
-    the thing it is checking verifies nothing.
+    Deliberately does not reuse build_splits' result: a check that trusts the
+    thing it is checking verifies nothing.
     """
-    remaining, _, cos = find_duplicates(test_img[keep], train_img)
+    remaining, _, cos = find_duplicates(images[test_idx], images[train_idx])
     n = int(remaining.sum())
     if n:
         raise AssertionError(
             f"{n} test images still duplicate a training scan after exclusion "
             f"(max cosine {cos[remaining].max():.4f}) -- the split is not clean")
-    return {"checked": int(keep.sum()), "max_cosine": float(cos.max())}
+    return {"checked": len(test_idx), "max_cosine": float(cos.max())}
 
 
-def leak_report(train_img, train_lab, test_img, test_lab, keep, classes):
-    """Bound the leakage that cannot be removed, rather than ignoring it.
+def neighbour_report(images, labels, train_idx, test_idx):
+    """How close held-out images get to training ones, against a null.
 
-    Exact repeats are gone by the time this runs. What remains possible is two
-    different slices of the same patient, which no pixel comparison can identify
-    without patient IDs. This measures how close the surviving test images get
-    to the training set, against a null: the nearest training image of a
-    *different* class, which is almost certainly a different patient.
-
-    A same-class distribution that sits far above that null, with mass at high
-    similarity, is the signature of same-patient bleed.
+    The different-class nearest neighbour is near-certainly a different patient,
+    so it is the null. With patients disjoint the two distributions should sit
+    close together; same-class mass far above the null is the signature this
+    split exists to prevent.
     """
     from .data import fingerprints
-    f_tr, f_te = fingerprints(train_img), fingerprints(test_img[keep])
-    lab = test_lab[keep]
+    f_tr = fingerprints(images[train_idx])
+    f_te = fingerprints(images[test_idx])
+    lab_tr, lab_te = labels[train_idx], labels[test_idx]
     same, diff = [], []
-    for i in range(len(lab)):
+    for i in range(len(lab_te)):
         row = f_te[i] @ f_tr.T
-        m = train_lab == lab[i]
+        m = lab_tr == lab_te[i]
         same.append(row[m].max())
         diff.append(row[~m].max())
     same, diff = np.array(same), np.array(diff)
+    bands = (0.99, 0.98, 0.95, 0.90)
     return {"same_class": same, "other_class": diff,
-            "bands": {t: float((same >= t).mean()) for t in (0.99, 0.98, 0.95, 0.90)},
-            "null_bands": {t: float((diff >= t).mean()) for t in (0.99, 0.98, 0.95, 0.90)}}
+            "bands": {t: float((same >= t).mean()) for t in bands},
+            "null_bands": {t: float((diff >= t).mean()) for t in bands}}
+
+
+def write_exclusions(names, S, path=None):
+    """Persist which files were dropped and why.
+
+    A count in a notebook cell is not auditable; filenames can be re-derived,
+    diffed between runs, or argued with.
+    """
+    import json
+
+    from .config import OUTPUTS
+    path = path or OUTPUTS / "excluded.json"
+    body = {
+        "dropped_as_duplicate": sorted(
+            str(n) for n, k in zip(names, S["keep"]) if not k),
+        "rule": {"duplicate_cosine": float(DUP_COSINE),
+                 "duplicate_pixel_l1": float(DUP_L1),
+                 "grouping": "patient id, merged across duplicate clusters",
+                 "patient_group_merges": int(S["n_group_merges"])},
+    }
+    body["counts"] = {"dropped_as_duplicate": len(body["dropped_as_duplicate"]),
+                      "kept": int(S["keep"].sum())}
+    Path(path).write_text(json.dumps(body, indent=2), encoding="utf-8")
+    return body

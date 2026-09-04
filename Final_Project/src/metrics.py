@@ -1,14 +1,10 @@
-"""Scoring. Macro averages are the default here, and that is a decision.
+"""Scoring. Macro averages are the default, and that is a decision.
 
-Cleaning the dataset in Phase 1 left the classes uneven -- notumor lost the most,
-because its source collection spread each subject's slices across both shipped
-folders, so removing same-patient bleed removed more of that class than of any
-other. The test set runs from 88 notumor images to 375 glioma.
-
-Plain accuracy on an imbalanced test set is a weighted average that hides the
-small classes. A model that handled the three large classes well and failed
-notumor entirely would still post a respectable figure. Macro averaging weights
-every class equally, so the failure shows.
+Cheng is uneven by nature: 286 glioma against 142 meningioma in the test split.
+Plain accuracy on an imbalanced set is a weighted average that hides the small
+classes -- a model that handled glioma and pituitary well and failed meningioma
+entirely would still post a respectable figure. Macro averaging weights every
+class equally, so the failure shows.
 """
 import numpy as np
 import torch
@@ -21,9 +17,9 @@ from .config import DEVICE
 def predict(model, loader):
     """True labels, predictions and probabilities for a whole loader.
 
-    model.eval() is not optional and not cosmetic: with BatchNorm in training
-    mode a batch is normalised by its own statistics, and on small batches that
-    alone can drop accuracy from 0.97 to near chance.
+    model.eval() is not cosmetic: with BatchNorm in training mode a batch is
+    normalised by its own statistics, and on small batches that alone can drop
+    accuracy from 0.97 to near chance.
     """
     model.eval()
     y_true, y_pred, probs = [], [], []
@@ -36,18 +32,15 @@ def predict(model, loader):
     return (np.concatenate(y_true), np.concatenate(y_pred), np.concatenate(probs))
 
 
-def confusion(y_true, y_pred, n_classes=4):
+def confusion(y_true, y_pred, n_classes=3):
     return confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
 
 
 def per_class_report(y_true, y_pred, classes):
     """Precision, recall and F1 per class, plus macro and weighted averages.
 
-    Precision answers "of the scans we called glioma, how many were" -- the
-    number that matters for unnecessary follow-up. Recall answers "of the scans
-    that really were glioma, how many we caught" -- the number that matters
-    clinically, because its complement is the missed-diagnosis rate. F1 is their
-    harmonic mean, which punishes buying one by sacrificing the other.
+    Precision drives unnecessary follow-up; recall's complement is the
+    missed-diagnosis rate. F1 punishes buying one by sacrificing the other.
     """
     rows = []
     for c, name in enumerate(classes):
@@ -72,7 +65,7 @@ def per_class_report(y_true, y_pred, classes):
     return rows
 
 
-def macro_f1(y_true, y_pred, n_classes=4):
+def macro_f1(y_true, y_pred, n_classes=3):
     """Macro F1 as a single number, for model selection."""
     scores = []
     for c in range(n_classes):
@@ -95,13 +88,13 @@ def print_report(rows):
               f"{r['f1']:>9.4f}{r['support']:>9}")
 
 
-def bootstrap_ci(y_true, y_pred, metric="accuracy", class_idx=None, n_classes=4,
+def bootstrap_ci(y_true, y_pred, metric="accuracy", class_idx=None, n_classes=3,
                  n_boot=1000, seed=0):
     """95% interval by resampling the test set with replacement.
 
-    A single figure computed on one particular sample of held-out images is a
-    point estimate with real uncertainty attached, and quoting it to four
-    decimal places implies a precision the sample size does not support.
+    Quoting a point estimate to four decimals implies a precision the sample
+    size does not support. Note these resample images, not patients, so on a
+    dataset with many slices per patient they are optimistic.
     """
     rng = np.random.default_rng(seed)
     if class_idx is None:
@@ -119,7 +112,7 @@ def bootstrap_ci(y_true, y_pred, metric="accuracy", class_idx=None, n_classes=4,
     return score(pool), float(np.percentile(stats, 2.5)), float(np.percentile(stats, 97.5))
 
 
-def roc_ovr(y_true, probs, n_classes=4):
+def roc_ovr(y_true, probs, n_classes=3):
     """One-vs-rest ROC curves and AUCs, plus the macro average."""
     from sklearn.metrics import auc, roc_curve
     curves, aucs = [], []
